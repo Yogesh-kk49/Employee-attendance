@@ -21,66 +21,54 @@ from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
-# ---------------------------------------------------------------------------
-# Database connection
-# ---------------------------------------------------------------------------
+# Database configuration
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "attendance_db")
 
-# Use a short serverSelectionTimeoutMS so that importing this module
-# (e.g. during testing) does NOT block for 30 seconds if MongoDB is absent.
-# The timeout is only hit when an actual operation is attempted.
 client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 db = client[MONGO_DB]
 
-# IST offset – used everywhere we need to interpret an instant as a calendar date
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
-# ---------------------------------------------------------------------------
-# Startup: create indexes idempotently (inside lifespan, NOT at import time)
-# ---------------------------------------------------------------------------
 def _create_indexes():
-    """Create all required indexes. Called at server startup only."""
-    # employees: unique on emp_code (handles concurrent duplicate-create races)
+    """Create required indexes idempotently at application startup."""
+    # Enforce uniqueness on emp_code to handle concurrent employee creations
     db.employees.create_index([("emp_code", ASCENDING)], unique=True, name="emp_code_unique")
 
-    # attendance_logs: unique on (emp_code, date) – handles concurrent punch-in races
+    # Enforce composite natural key uniqueness to handle concurrent punch-in attempts
     db.attendance_logs.create_index(
         [("emp_code", ASCENDING), ("date", ASCENDING)],
         unique=True,
         name="emp_date_unique",
     )
-    # Support list_attendance queries: sort by date desc, emp_code asc
+    # Optimized index for paginated attendance queries sorted by date desc, emp_code asc
     db.attendance_logs.create_index(
         [("date", DESCENDING), ("emp_code", ASCENDING)],
         name="date_desc_emp_asc",
     )
-    # Support analytics filtering by month prefix
+    # Date index for range-filtered analytics queries
     db.attendance_logs.create_index([("date", ASCENDING)], name="date_asc")
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    """FastAPI lifespan: create indexes at startup."""
+    """FastAPI lifespan context manager for startup tasks."""
     _create_indexes()
     yield
 
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-EPOCH_MIN = 100_000_000_000   # minimum valid epoch-ms (avoids seconds-epoch)
-EPOCH_MAX = 4_102_444_800_000  # year 2100 guard
+# Timestamp boundary constants for validation
+EPOCH_MIN = 100_000_000_000   # Minimum valid epoch milliseconds (avoids seconds-epoch values)
+EPOCH_MAX = 4_102_444_800_000  # Year 2100 upper bound
 
 PRESENCE_STATUSES = {"PRESENT", "WFH", "ON_DUTY"}
 ALL_STATUSES = {"PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"}
 
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
+
+# Calculation helpers
 
 def half_up(value: float, decimals: int = 2) -> float:
     """Round to `decimals` places using half-up (not banker's) rounding."""
@@ -229,9 +217,7 @@ def fmt_employee(doc: dict) -> dict:
     return doc
 
 
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
+# Request and response schemas
 
 def validate_epoch_ms(v):
     """Reject values that look like seconds, or are out of reasonable range."""
@@ -324,9 +310,7 @@ class RegularizeRequest(BaseModel):
         return self
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
+# System endpoints
 
 @app.get("/health")
 def health():
@@ -338,7 +322,7 @@ def health():
     return {"status": "ok"}
 
 
-# ---- Employees ----
+# Employee management endpoints
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
@@ -375,7 +359,7 @@ def list_employees(
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
-# ---- Attendance ----
+# Attendance tracking endpoints
 
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInRequest):
@@ -657,9 +641,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
     return fmt_record(update_result)
 
 
-# ---------------------------------------------------------------------------
-# Analytics helpers
-# ---------------------------------------------------------------------------
+# Analytics helper functions
 
 def month_date_range(month: str):
     """Return (first_day_str, last_day_str) for a YYYY-MM month string."""
@@ -684,9 +666,7 @@ def working_days_in_range(start_str: str, end_str: str) -> int:
     return count
 
 
-# ---------------------------------------------------------------------------
 # Analytics endpoints
-# ---------------------------------------------------------------------------
 
 @app.get("/analytics/employees/{emp_code}/monthly")
 def employee_monthly(emp_code: str, month: str = Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")):
@@ -986,12 +966,7 @@ def department_trend(
     if not db.employees.find_one({"department": department}):
         raise HTTPException(404, f"Department {department!r} not found")
 
-    # ------------------------------------------------------------------
-    # Build a full list of dates using Python (gap-filling without $densify
-    # complexity for small ranges <= 92 days)
-    # We still use an aggregation for the log data, but fill gaps in Python.
-    # $densify requires MongoDB 5.1+; this approach is safer and simpler.
-    # ------------------------------------------------------------------
+    # Generate full sequence of calendar days in range to ensure all dates are present
     all_dates = []
     cur = start_date
     while cur <= end_date:
@@ -1078,9 +1053,7 @@ def department_trend(
     return {"department": department, "items": raw_items}
 
 
-# ---------------------------------------------------------------------------
-# Admin / Explain
-# ---------------------------------------------------------------------------
+# Admin and query analysis endpoints
 
 @app.get("/admin/explain/{endpoint}")
 def explain_endpoint(

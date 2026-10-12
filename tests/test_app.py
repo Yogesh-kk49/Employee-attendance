@@ -31,7 +31,7 @@ from typing import Generator
 import pytest
 from fastapi.testclient import TestClient
 
-# ============================================================
+# Environment and test database setup
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -41,7 +41,7 @@ TEST_MONGO_DB = os.getenv("TEST_MONGO_DB", "attendance_test_db")
 os.environ["MONGO_URI"] = TEST_MONGO_URI
 os.environ["MONGO_DB"] = TEST_MONGO_DB
 
-from app.main import (  # noqa: E402  (import after env set)
+from app.main import (  # noqa: E402
     IST,
     _create_indexes,
     app,
@@ -55,9 +55,7 @@ from app.main import (  # noqa: E402  (import after env set)
     recompute_derived,
 )
 
-# ============================================================
-# MongoDB availability check
-# ============================================================
+# MongoDB connectivity check for conditional integration test execution
 
 def _mongo_available() -> bool:
     try:
@@ -72,12 +70,10 @@ def _mongo_available() -> bool:
 MONGO_AVAILABLE = _mongo_available()
 skip_if_no_mongo = pytest.mark.skipif(
     not MONGO_AVAILABLE,
-    reason="MongoDB unavailable – integration test skipped",
+    reason="MongoDB unavailable - integration test skipped",
 )
 
-# ============================================================
-# UNIT TESTS
-# ============================================================
+# Unit Tests (runnable without database connection)
 
 
 class TestHalfUp:
@@ -323,9 +319,7 @@ class TestPydanticModels:
             )
 
 
-# ============================================================
-# INTEGRATION TESTS
-# ============================================================
+# Integration Tests (executed when MongoDB connection is available)
 
 @pytest.fixture(scope="module")
 def client() -> Generator:
@@ -347,7 +341,7 @@ def client() -> Generator:
     db.client.drop_database(TEST_MONGO_DB)
 
 
-# ---- Employee endpoints ----
+# Employee management tests
 
 @skip_if_no_mongo
 class TestEmployees:
@@ -424,7 +418,7 @@ class TestEmployees:
         assert item1 != item2  # different employees
 
 
-# ---- Punch-in endpoint ----
+# Punch-in tests
 
 @skip_if_no_mongo
 class TestPunchIn:
@@ -490,7 +484,7 @@ class TestPunchIn:
         assert r.json()["late_minutes"] == 35
 
 
-# ---- Punch-out endpoint ----
+# Punch-out tests
 
 @skip_if_no_mongo
 class TestPunchOut:
@@ -546,7 +540,7 @@ class TestPunchOut:
         assert data["work_hours"] == 9.08
 
 
-# ---- List attendance ----
+# Attendance log listing tests
 
 @skip_if_no_mongo
 class TestListAttendance:
@@ -597,7 +591,7 @@ class TestListAttendance:
                 assert item["punch_out"] >= 100_000_000_000
 
 
-# ---- Regularize ----
+# Attendance regularization (manual correction) tests
 
 @skip_if_no_mongo
 class TestRegularize:
@@ -660,7 +654,7 @@ class TestRegularize:
         assert len(r.json()["history"]) == 2
 
 
-# ---- Analytics ----
+# Analytics and aggregation pipeline tests
 
 @skip_if_no_mongo
 class TestEmployeeMonthly:
