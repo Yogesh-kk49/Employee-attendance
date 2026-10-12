@@ -1,0 +1,146 @@
+# Employee Attendance & Analytics API
+
+FastAPI + MongoDB implementation of the HROne engineering assignment.
+
+---
+
+## Prerequisites
+
+- Python 3.10 or newer
+- MongoDB 6.0 or newer (local, Docker, or Atlas free tier M0)
+
+---
+
+## Setup
+
+```bash
+# 1. Clone / unzip the project
+cd candidate_project
+
+# 2. Create and activate a virtual environment
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# macOS / Linux
+source .venv/bin/activate
+
+# 3. Install dependencies
+pip install -r requirements.txt
+```
+
+---
+
+## Environment variables
+
+Create a `.env` file in the project root (never commit it):
+
+```
+MONGO_URI=mongodb://localhost:27017
+MONGO_DB=attendance_db
+```
+
+Real environment variables always win over `.env`. For Atlas:
+
+```
+MONGO_URI=mongodb+srv://<user>:<password>@<cluster>.mongodb.net/?retryWrites=true
+MONGO_DB=attendance_db
+```
+
+> MongoDB indexes are created **automatically at server startup** — you do not need to run any migration script.
+
+---
+
+## Seed sample data (optional)
+
+```bash
+python sample_seed.py
+```
+
+This loads the 9 sample documents from `sample_data/` into the configured database.  
+The grader uses a much larger hidden dataset; the sample data shows document shapes only.
+
+---
+
+## Start the server
+
+```bash
+uvicorn app.main:app --port 8000 --reload
+```
+
+Swagger UI: http://localhost:8000/docs  
+OpenAPI JSON: http://localhost:8000/openapi.json  
+Readiness probe: http://localhost:8000/health
+
+---
+
+## API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Readiness probe (pings MongoDB) |
+| `POST` | `/employees` | Create an employee |
+| `GET` | `/employees` | List employees (paginated, sorted by `emp_code`) |
+| `POST` | `/attendance/punch-in` | Record punch-in (creates attendance record) |
+| `POST` | `/attendance/punch-out` | Record punch-out (closes open record) |
+| `GET` | `/attendance` | List attendance records (paginated, DB-side sort) |
+| `PATCH` | `/attendance/{emp_code}/{date}` | Regularize (manually correct) a record |
+| `GET` | `/analytics/employees/{emp_code}/monthly` | Monthly summary for one employee |
+| `GET` | `/analytics/departments/summary` | Department summary for a month |
+| `GET` | `/analytics/leaderboard/late` | Late-comers leaderboard |
+| `GET` | `/analytics/departments/{department}/trend` | Daily attendance trend |
+| `GET` | `/admin/explain/{endpoint}` | MongoDB explain for an endpoint's query |
+
+Full contract: see `openapi.yaml`. Business rules R1–R10 are documented there.
+
+---
+
+## Running tests
+
+```bash
+# All tests (unit tests run; integration tests skip if MongoDB is unavailable)
+pytest tests/test_app.py -v
+
+# Unit tests only (no MongoDB required)
+pytest tests/test_app.py -v -k "TestHalfUp or TestEpoch or TestAttendance or TestLate or TestWork or TestOvertime or TestRecompute or TestPydantic"
+
+# Integration tests only (require a running MongoDB)
+TEST_MONGO_URI=mongodb://localhost:27017 TEST_MONGO_DB=attendance_test_db \
+    pytest tests/test_app.py -v -k "not (TestHalfUp or TestEpoch or TestAttendanceDate or TestLateMinutes or TestWorkHours or TestOvertimeMinutes or TestRecompute or TestPydantic)"
+```
+
+**Integration tests use a separate database** (`attendance_test_db` by default, configurable via `TEST_MONGO_DB`). The database is dropped before and after the test run — production data is never touched.
+
+If MongoDB is unavailable, integration tests are automatically skipped and reported as `SKIPPED`, not as passing.
+
+---
+
+## Project structure
+
+```
+candidate_project/
+├── app/
+│   └── main.py          # All application code (single file, as required)
+├── sample_data/
+│   ├── employees.json
+│   └── attendance_logs.json
+├── tests/
+│   └── test_app.py      # Unit + integration tests
+├── openapi.yaml          # API contract (source of truth)
+├── DATA_MODEL.md         # MongoDB schema and sample documents
+├── REVIEW.md             # Defects found in the starter code
+├── DECISIONS.md          # Design rationale and trade-offs
+├── README.md             # This file
+├── requirements.txt
+└── sample_seed.py        # Loads sample_data/ into MongoDB
+```
+
+---
+
+## Key implementation notes
+
+- **All timestamps** in requests and responses are **epoch milliseconds** (integer). Values that look like seconds (< 100,000,000,000) are rejected with 422.
+- **Rounding** uses half-up (not Python's default banker's rounding) via `Decimal.quantize(ROUND_HALF_UP)`.
+- **Concurrency** for punch-in and employee creation is handled by MongoDB unique indexes, not application-level locks.
+- **Regularization** uses optimistic concurrency (history-length check) to prevent silent lost updates.
+- **Analytics** read stored derived values (`work_hours`, `late_minutes`, etc.) — they do not recompute from punch times.
+- **No `.env` file, no secrets, no Dockerfile** are included in the submission.
