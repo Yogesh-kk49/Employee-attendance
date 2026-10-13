@@ -41,6 +41,8 @@ TEST_MONGO_DB = os.getenv("TEST_MONGO_DB", "attendance_test_db")
 os.environ["MONGO_URI"] = TEST_MONGO_URI
 os.environ["MONGO_DB"] = TEST_MONGO_DB
 
+from fastapi import HTTPException
+
 from app.main import (  # noqa: E402
     IST,
     _create_indexes,
@@ -52,6 +54,8 @@ from app.main import (  # noqa: E402
     dt_to_ms,
     half_up,
     ms_to_dt,
+    parse_date,
+    parse_month,
     recompute_derived,
 )
 
@@ -173,9 +177,18 @@ class TestLateMinutes:
         # 09:40:00 IST = exactly 10 min after 09:30 → NOT late (needs strictly > 10)
         assert compute_late_minutes(self._punch(9, 40, 0), "09:30", "2026-07-06") == 0
 
+    def test_just_before_grace_expiry(self):
+        # 09:39:59 IST = 9 min 59 sec after 09:30 → NOT late
+        assert compute_late_minutes(self._punch(9, 39, 59), "09:30", "2026-07-06") == 0
+
     def test_one_second_past_grace(self):
         # 09:40:01 IST = 10 min 1 sec after 09:30 → 10 minutes late
         assert compute_late_minutes(self._punch(9, 40, 1), "09:30", "2026-07-06") == 10
+
+    def test_thirty_seconds_past_grace_boundary(self):
+        # 09:40:30 IST = 10 min 30 sec after 09:30 → 10 minutes late (whole-minute floor)
+        # Note: starter code bug did int(seconds / 60) > 10 which gave 10 > 10 == False
+        assert compute_late_minutes(self._punch(9, 40, 30), "09:30", "2026-07-06") == 10
 
     def test_example_from_spec_45min(self):
         # 10:15:59 IST → 45 min 59 sec → floor = 45 min late
@@ -229,6 +242,11 @@ class TestOvertimeMinutes:
     def test_under_30min_no_overtime(self):
         # punch_out at 18:35, shift_end 18:30 → 5 min < 30 → 0
         po = self._ist("2026-07-06", 18, 35)
+        assert compute_overtime_minutes(po, "18:30", "2026-07-06", False) == 0
+
+    def test_just_below_30min_threshold(self):
+        # 18:59:59 – 18:30:00 = 29 min 59 sec < 30 min → 0
+        po = self._ist("2026-07-06", 18, 59, 59)
         assert compute_overtime_minutes(po, "18:30", "2026-07-06", False) == 0
 
     def test_exactly_30min(self):
@@ -317,6 +335,43 @@ class TestPydanticModels:
                 reason="test reason",
                 regularized_by="hr.admin",
             )
+
+
+class TestStrictDateValidation:
+    """Strict YYYY-MM-DD and YYYY-MM parsing tests."""
+
+    def test_valid_date(self):
+        d = parse_date("2026-07-06")
+        assert d.isoformat() == "2026-07-06"
+
+    def test_rejects_unseparated_digits_20260706(self):
+        with pytest.raises(HTTPException) as exc_info:
+            parse_date("20260706")
+        assert exc_info.value.status_code == 422
+
+    def test_rejects_week_date_format(self):
+        with pytest.raises(HTTPException) as exc_info:
+            parse_date("2026-W28-1")
+        assert exc_info.value.status_code == 422
+
+    def test_rejects_datetime_format(self):
+        with pytest.raises(HTTPException) as exc_info:
+            parse_date("2026-07-06T10:00")
+        assert exc_info.value.status_code == 422
+
+    def test_rejects_impossible_calendar_date(self):
+        with pytest.raises(HTTPException) as exc_info:
+            parse_date("2026-02-30")
+        assert exc_info.value.status_code == 422
+
+    def test_valid_month(self):
+        year, month = parse_month("2026-07")
+        assert (year, month) == (2026, 7)
+
+    def test_rejects_invalid_month(self):
+        with pytest.raises(HTTPException) as exc_info:
+            parse_month("2026-13")
+        assert exc_info.value.status_code == 422
 
 
 # Integration Tests (executed when MongoDB connection is available)
@@ -539,6 +594,14 @@ class TestPunchOut:
         assert data["overtime_minutes"] == 40
         assert data["work_hours"] == 9.08
 
+    def test_punch_out_latest_closed_does_not_fall_back_409(self, client):
+        # When latest record is already closed, punch-out returns 409
+        r = client.post("/attendance/punch-out", json={
+            "emp_code": "EMP0001",
+            "punched_at": self.PUNCH_OUT_TS + 10_000,
+        })
+        assert r.status_code == 409
+
 
 # Attendance log listing tests
 
@@ -653,6 +716,29 @@ class TestRegularize:
         assert r.status_code == 200
         assert len(r.json()["history"]) == 2
 
+    def test_regularize_concurrent_modification_conflict_409(self, client, monkeypatch):
+        # Simulate concurrent modification between read and atomic update
+        from pymongo.collection import Collection
+        orig_find_one = Collection.find_one
+
+        def mock_find_one(col_self, *args, **kwargs):
+            res = orig_find_one(col_self, *args, **kwargs)
+            if col_self.name == "attendance_logs" and res is not None:
+                # Interleaved concurrent write updates the record's history
+                col_self.update_one(
+                    {"emp_code": "EMP0001", "date": "2026-07-06"},
+                    {"$push": {"history": {"at": datetime.now(timezone.utc), "by": "other", "reason": "concurrent", "changes": {}}}}
+                )
+            return res
+
+        monkeypatch.setattr(Collection, "find_one", mock_find_one)
+        r = client.patch("/attendance/EMP0001/2026-07-06", json={
+            "punch_in": 1_783_312_200_000,
+            "reason": "concurrent edit attempt",
+            "regularized_by": "hr.admin",
+        })
+        assert r.status_code == 409
+
 
 # Analytics and aggregation pipeline tests
 
@@ -737,6 +823,31 @@ class TestLateLeaderboard:
         for item in items:
             assert item["rank"] <= 1
 
+    def test_leaderboard_competition_ranking_with_ties(self, client):
+        # Insert test records for month 2026-09 where two employees tie
+        from app.main import db
+        db.attendance_logs.delete_many({"date": {"$regex": "^2026-09"}})
+        db.attendance_logs.insert_many([
+            {"emp_code": "EMP0001", "date": "2026-09-01", "status": "PRESENT", "late_minutes": 25, "history": []},
+            {"emp_code": "EMP0002", "date": "2026-09-01", "status": "PRESENT", "late_minutes": 25, "history": []},
+            {"emp_code": "EMP0003", "date": "2026-09-01", "status": "PRESENT", "late_minutes": 10, "history": []},
+        ])
+        r = client.get("/analytics/leaderboard/late?month=2026-09&limit=2")
+        assert r.status_code == 200
+        items = r.json()["items"]
+        # Both tied at rank 1 must be present because rank <= 2
+        assert len(items) == 2
+        assert items[0]["rank"] == 1
+        assert items[1]["rank"] == 1
+        assert items[0]["total_late_minutes"] == 25
+        assert items[1]["total_late_minutes"] == 25
+        db.attendance_logs.delete_many({"date": {"$regex": "^2026-09"}})
+
+    def test_leaderboard_empty_month_returns_empty_items(self, client):
+        r = client.get("/analytics/leaderboard/late?month=2025-01")
+        assert r.status_code == 200
+        assert r.json()["items"] == []
+
 
 @skip_if_no_mongo
 class TestDepartmentTrend:
@@ -746,6 +857,20 @@ class TestDepartmentTrend:
         data = r.json()
         assert data["department"] == "Engineering"
         assert len(data["items"]) == 5  # 5 calendar days
+
+    def test_trend_empty_attendance_logs_returns_all_days(self, client):
+        # Engineering exists in seed, request a range in 2026 with zero logs (2026-05-01 to 2026-05-05)
+        r = client.get("/analytics/departments/Engineering/trend?from=2026-05-01&to=2026-05-05")
+        assert r.status_code == 200
+        items = r.json()["items"]
+        assert len(items) == 5
+        for item in items:
+            assert item["present_count"] == 0.0
+            assert item["late_count"] == 0
+            if item["is_working_day"]:
+                assert item["attendance_rate"] == 0.0
+            else:
+                assert item["attendance_rate"] is None
 
     def test_trend_required_fields(self, client):
         r = client.get("/analytics/departments/Engineering/trend?from=2026-07-06&to=2026-07-08")
@@ -809,6 +934,18 @@ class TestExplain:
         # department_summary starts from the employees collection
         assert data["collection"] == "employees"
         assert "explain" in data
+
+    def test_explain_department_summary_uses_ixscan_no_collscan(self, client):
+        r = client.get("/admin/explain/department_summary?month=2026-07")
+        assert r.status_code == 200
+        data = r.json()
+        stages = data["explain"].get("stages", [])
+        assert len(stages) > 0
+        cursor_stage = stages[0].get("$cursor", {})
+        winning_plan = cursor_stage.get("queryPlanner", {}).get("winningPlan", {})
+        plan_str = str(winning_plan)
+        assert "IXSCAN" in plan_str
+        assert "COLLSCAN" not in plan_str
 
     def test_explain_late_leaderboard(self, client):
         r = client.get("/admin/explain/late_leaderboard?month=2026-07")

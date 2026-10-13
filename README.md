@@ -46,7 +46,9 @@ MONGO_URI=mongodb+srv://<user>:<password>@<cluster>.mongodb.net/?retryWrites=tru
 MONGO_DB=attendance_db
 ```
 
-> MongoDB indexes are created **automatically at server startup** — you do not need to run any migration script.
+> MongoDB indexes are created **automatically at server startup** with a bounded retry mechanism and logging:
+> - `employees`: `emp_code` (unique), `joined_on`, `(department, joined_on)` compound
+> - `attendance_logs`: `(emp_code, date)` (unique), `(date DESC, emp_code ASC)` compound, `date ASC`
 
 ---
 
@@ -77,7 +79,7 @@ Readiness probe: http://localhost:8000/health
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Readiness probe (pings MongoDB) |
+| `GET` | `/health` | Readiness probe (pings MongoDB and verifies index initialization) |
 | `POST` | `/employees` | Create an employee |
 | `GET` | `/employees` | List employees (paginated, sorted by `emp_code`) |
 | `POST` | `/attendance/punch-in` | Record punch-in (creates attendance record) |
@@ -86,11 +88,11 @@ Readiness probe: http://localhost:8000/health
 | `PATCH` | `/attendance/{emp_code}/{date}` | Regularize (manually correct) a record |
 | `GET` | `/analytics/employees/{emp_code}/monthly` | Monthly summary for one employee |
 | `GET` | `/analytics/departments/summary` | Department summary for a month |
-| `GET` | `/analytics/leaderboard/late` | Late-comers leaderboard |
-| `GET` | `/analytics/departments/{department}/trend` | Daily attendance trend |
+| `GET` | `/analytics/leaderboard/late` | Late-comers leaderboard ($setWindowFields rank) |
+| `GET` | `/analytics/departments/{department}/trend` | Daily attendance trend ($densify gap-filling) |
 | `GET` | `/admin/explain/{endpoint}` | MongoDB explain for an endpoint's query |
 
-Business rules R1–R10 are documented in `DECISIONS.md`.
+Business rules R1–R10 and schema contracts are specified in `openapi.yaml` and `DATA_MODEL.md`.
 
 ---
 
@@ -101,11 +103,11 @@ Business rules R1–R10 are documented in `DECISIONS.md`.
 pytest tests/test_app.py -v
 
 # Unit tests only (no MongoDB required)
-pytest tests/test_app.py -v -k "TestHalfUp or TestEpoch or TestAttendance or TestLate or TestWork or TestOvertime or TestRecompute or TestPydantic"
+pytest tests/test_app.py -v -k "TestHalfUp or TestEpoch or TestAttendance or TestLate or TestWork or TestOvertime or TestRecompute or TestPydantic or TestStrictDateValidation"
 
 # Integration tests only (require a running MongoDB)
 TEST_MONGO_URI=mongodb://localhost:27017 TEST_MONGO_DB=attendance_test_db \
-    pytest tests/test_app.py -v -k "not (TestHalfUp or TestEpoch or TestAttendanceDate or TestLateMinutes or TestWorkHours or TestOvertimeMinutes or TestRecompute or TestPydantic)"
+    pytest tests/test_app.py -v -k "not (TestHalfUp or TestEpoch or TestAttendanceDate or TestLateMinutes or TestWorkHours or TestOvertimeMinutes or TestRecompute or TestPydantic or TestStrictDateValidation)"
 ```
 
 **Integration tests use a separate database** (`attendance_test_db` by default, configurable via `TEST_MONGO_DB`). The database is dropped before and after the test run — production data is never touched.
@@ -125,9 +127,11 @@ candidate_project/
 │   └── attendance_logs.json
 ├── tests/
 │   └── test_app.py      # Unit + integration tests
+├── openapi.yaml          # Formal API specification & business rules R1-R10
+├── DATA_MODEL.md         # Data model specification & MongoDB schema contracts
 ├── REVIEW.md             # Defects found in the starter code
-├── DECISIONS.md          # Design rationale and trade-offs
-├── README.md             # This file
+├── DECISIONS.md          # Architectural decisions & design rationale
+├── README.md             # Setup and operational documentation
 ├── requirements.txt
 └── sample_seed.py        # Loads sample_data/ into MongoDB
 ```
@@ -138,9 +142,9 @@ candidate_project/
 
 - **All timestamps** in requests and responses are **epoch milliseconds** (integer). Values that look like seconds (< 100,000,000,000) are rejected with 422.
 - **Rounding** uses half-up (not Python's default banker's rounding) via `Decimal.quantize(ROUND_HALF_UP)`.
-- **Concurrency** for punch-in and employee creation is handled by MongoDB unique indexes, not application-level locks.
-- **Regularization** uses optimistic concurrency (history-length check) to prevent silent lost updates.
-- **Analytics** read stored derived values (`work_hours`, `late_minutes`, etc.) — they do not recompute from punch times.
-- **Department trend** uses MongoDB `$densify` + `$setWindowFields` for gap-filling and moving averages inside the database.
-- **Explain endpoint** uses `db.command("explain", ..., verbosity="executionStats")` and mirrors the exact aggregation pipeline each endpoint runs.
+- **Concurrency** for punch-in and employee creation is handled by MongoDB unique indexes (`DuplicateKeyError` → 409), avoiding application-level locks.
+- **Regularization** uses optimistic concurrency (matching pre-read state and history length) to detect concurrent updates and return 409 Conflict.
+- **Analytics pushdown**: Leaderboard competition ranking uses `$setWindowFields` with `$rank`, department summary starts from `employees` with correlated `$lookup` (preserving zero-log headcount), and department trend uses `$densify` with 7-day moving average windows in MongoDB.
+- **Explain endpoint** uses `db.command("explain", ..., verbosity="executionStats")` and shares the exact pipelines used by the operational endpoints.
 - **No `.env` file or secrets** are committed to the repository.
+
