@@ -791,10 +791,38 @@ class TestExplain:
         assert data["endpoint"] == "attendance_list"
         assert data["collection"] == "attendance_logs"
         assert "explain" in data
+        # Must use executionStats verbosity, not just queryPlanner
+        assert "executionStats" in data["explain"]
 
     def test_explain_employee_monthly(self, client):
         r = client.get("/admin/explain/employee_monthly?emp_code=EMP0001&month=2026-07")
         assert r.status_code == 200
+        data = r.json()
+        assert data["collection"] == "attendance_logs"
+        # executionStats present for aggregate explain too
+        assert "executionStats" in data["explain"] or "stages" in data["explain"]
+
+    def test_explain_department_summary_uses_employees_collection(self, client):
+        r = client.get("/admin/explain/department_summary?month=2026-07")
+        assert r.status_code == 200
+        data = r.json()
+        # department_summary starts from the employees collection
+        assert data["collection"] == "employees"
+        assert "explain" in data
+
+    def test_explain_late_leaderboard(self, client):
+        r = client.get("/admin/explain/late_leaderboard?month=2026-07")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["collection"] == "attendance_logs"
+        assert "explain" in data
+
+    def test_explain_department_trend(self, client):
+        r = client.get("/admin/explain/department_trend?department=Engineering&from=2026-07-01&to=2026-07-07")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["collection"] == "attendance_logs"
+        assert "explain" in data
 
     def test_explain_missing_params_422(self, client):
         r = client.get("/admin/explain/employee_monthly")

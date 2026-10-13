@@ -33,15 +33,18 @@ Standard competition ranking (1, 2, 2, 4) is computed in Python after sorting: r
 
 ## 4. Headcount with zero-log employees
 
-The `GET /analytics/departments/summary` endpoint runs two separate aggregations:
+`GET /analytics/departments/summary` runs a **single aggregation pipeline** starting from the `employees` collection:
 
-1. **Employees pipeline** — groups `employees` by department with `joined_on <= last_day_of_month`. This gives `headcount` per department, including employees who have no attendance records at all.
-2. **Logs pipeline** — groups `attendance_logs` for the month (joined with `employees` via `$lookup`) by department, computing sums and averages.
+1. `$match` — employees with `joined_on <= last_day_of_month` (R9 headcount rule).
+2. `$lookup` (with correlated sub-pipeline) — fetches that employee's attendance logs for the month from `attendance_logs`.
+3. `$unwind` with `preserveNullAndEmptyArrays: true` — employees with zero logs produce one row with all `logs.*` fields null, so they still contribute to headcount.
+4. `$group` by department — accumulates headcount (`$addToSet` of `emp_code`), present days, late counts, work-hours sum/count, etc.
+5. `$project` — reshapes output; `avg_work_hours` is computed as `work_hours_sum / work_hours_count` inside MongoDB.
 
-The two results are merged in Python by department name. If a department appears in step 1 but not step 2, all its log-derived counts default to zero. This guarantees employees with no logs are counted in `headcount`.
+This is a single round-trip to the database. Zero-log employees are counted in `headcount` because of `preserveNullAndEmptyArrays: true`; their null `logs.*` fields contribute 0 to all sums via `$ifNull`.
 
 ## 5. One thing to change for 100× the data
 
-The `GET /analytics/departments/{department}/trend` endpoint iterates over all department employees in Python to compute per-day `headcount`. At 100× scale (thousands of employees per department, 92-day range = 92 iterations × thousands of employees) this becomes slow.
+`GET /analytics/departments/{department}/trend` now uses a single MongoDB aggregation pipeline with `$densify` (gap-fill every calendar day), `$setWindowFields` (7-day moving average), and a correlated `$lookup` per densified day to count how many employees had `joined_on <= that_day`. The Python layer only rounds and casts the results.
 
-The fix would be to pre-aggregate `headcount` per day with a MongoDB aggregation: group employees by department, then use an `$addFields`/`$filter` stage combined with a `$densify`-style range to count `joined_on <= day` for each day. Alternatively, store a running `headcount` snapshot in a separate collection updated on employee joins. This would move the O(employees × days) work entirely into the database.
+At 100× scale the per-day correlated `$lookup` for headcount becomes the bottleneck: for a 92-day range each densified document triggers a separate sub-query on `employees`, totalling 92 `$count` sub-aggregations. The fix is to pre-compute the headcount time-series in a single `$facet` or `$bucket` stage before `$densify`, then `$merge` or `$lookup` the array of `(date, count)` pairs into the densified stream. This reduces the headcount computation from O(days) sub-queries to a single O(employees) pass.
