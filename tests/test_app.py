@@ -595,12 +595,34 @@ class TestPunchOut:
         assert data["work_hours"] == 9.08
 
     def test_punch_out_latest_closed_does_not_fall_back_409(self, client):
-        # When latest record is already closed, punch-out returns 409
-        r = client.post("/attendance/punch-out", json={
+        from app.main import db
+        # Insert an older open record from the previous day
+        yesterday_pi = datetime(2026, 7, 5, 4, 0, tzinfo=timezone.utc)
+        db.attendance_logs.insert_one({
             "emp_code": "EMP0001",
-            "punched_at": self.PUNCH_OUT_TS + 10_000,
+            "date": "2026-07-05",
+            "status": "PRESENT",
+            "punch_in": yesterday_pi,
+            "punch_out": None,
+            "work_hours": None,
+            "late_minutes": 0,
+            "overtime_minutes": 0,
+            "half_day": False,
+            "history": [],
         })
-        assert r.status_code == 409
+        try:
+            # When latest record (2026-07-06) is already closed, punch-out returns 409
+            # and does NOT fall back to closing the older 2026-07-05 open record
+            r = client.post("/attendance/punch-out", json={
+                "emp_code": "EMP0001",
+                "punched_at": self.PUNCH_OUT_TS + 10_000,
+            })
+            assert r.status_code == 409
+            old_doc = db.attendance_logs.find_one({"emp_code": "EMP0001", "date": "2026-07-05"})
+            assert old_doc is not None
+            assert old_doc["punch_out"] is None  # Remains open
+        finally:
+            db.attendance_logs.delete_one({"emp_code": "EMP0001", "date": "2026-07-05"})
 
 
 # Attendance log listing tests
@@ -883,6 +905,12 @@ class TestDepartmentTrend:
         r = client.get("/analytics/departments/Nonexistent/trend?from=2026-07-06&to=2026-07-10")
         assert r.status_code == 404
 
+    def test_trend_empty_department_no_employees_returns_404(self, client):
+        # Empty department (no employees and no attendance logs) returns 404 per contract
+        r = client.get("/analytics/departments/ZeroEmployeesDept/trend?from=2026-07-06&to=2026-07-10")
+        assert r.status_code == 404
+        assert "not found" in r.json()["detail"].lower()
+
     def test_trend_to_before_from_422(self, client):
         r = client.get("/analytics/departments/Engineering/trend?from=2026-07-10&to=2026-07-06")
         assert r.status_code == 422
@@ -905,6 +933,13 @@ class TestHealth:
         r = client.get("/health")
         assert r.status_code == 200
         assert r.json() == {"status": "ok"}
+
+    def test_lifespan_startup_fails_on_index_error(self, monkeypatch):
+        from app import main
+        monkeypatch.setattr(main, "_create_indexes", lambda: False)
+        with pytest.raises(RuntimeError, match="Startup failed: Unable to initialize required MongoDB indexes"):
+            with TestClient(main.app):
+                pass
 
 
 @skip_if_no_mongo

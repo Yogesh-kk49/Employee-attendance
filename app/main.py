@@ -86,7 +86,8 @@ def _create_indexes(max_retries: int = 3, delay: float = 1.0) -> bool:
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     """FastAPI lifespan context manager for startup tasks."""
-    _create_indexes()
+    if not _create_indexes():
+        raise RuntimeError("Startup failed: Unable to initialize required MongoDB indexes")
     yield
 
 
@@ -496,41 +497,34 @@ def punch_out(body: PunchOutRequest):
     now_ms = body.punched_at if body.punched_at is not None else dt_to_ms(datetime.now(tz=timezone.utc))
     punch_out_dt = ms_to_dt(now_ms)
 
-    # Find the most recent open record whose punch_in <= punch_out_dt
-    open_record = db.attendance_logs.find_one(
+    # Select the latest applicable attendance record at or before punched_at
+    latest_record = db.attendance_logs.find_one(
         {
             "emp_code": body.emp_code,
             "punch_in": {"$ne": None, "$lte": punch_out_dt},
-            "punch_out": None,
         },
         sort=[("punch_in", DESCENDING)],
     )
 
-    if not open_record:
-        # Check if an open record exists with punch_in > punch_out_dt (client attempted punch-out before punch-in)
-        future_open = db.attendance_logs.find_one(
+    if not latest_record:
+        # Check if an attendance record exists with punch_in > punch_out_dt (client attempted punch-out before punch-in)
+        future_record = db.attendance_logs.find_one(
             {
                 "emp_code": body.emp_code,
                 "punch_in": {"$gt": punch_out_dt},
-                "punch_out": None,
             },
             sort=[("punch_in", ASCENDING)],
         )
-        if future_open:
+        if future_record:
             raise HTTPException(422, "punched_at must be after punch_in")
 
-        # Check if a closed record exists with punch_in <= punch_out_dt (already punched out)
-        closed = db.attendance_logs.find_one(
-            {
-                "emp_code": body.emp_code,
-                "punch_in": {"$ne": None, "$lte": punch_out_dt},
-            },
-            sort=[("punch_in", DESCENDING)],
-        )
-        if closed and closed.get("punch_out") is not None:
-            raise HTTPException(409, "Record is already punched out")
-
         raise HTTPException(404, "No open punch-in record found for this employee")
+
+    # If the latest applicable record is already closed, return 409 (never close an older open record)
+    if latest_record.get("punch_out") is not None:
+        raise HTTPException(409, "Record is already punched out")
+
+    open_record = latest_record
 
     punch_in_dt = open_record["punch_in"]
     if punch_in_dt.tzinfo is None:
@@ -1095,13 +1089,24 @@ def build_department_trend_pipeline(department: str, from_: str, to: str, from_d
         {
             "$lookup": {
                 "from": "employees",
-                "localField": "emp_code",
-                "foreignField": "emp_code",
+                "let": {"emp_code": "$emp_code"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$emp_code", "$$emp_code"]},
+                                    {"$eq": ["$department", department]},
+                                ]
+                            }
+                        }
+                    },
+                    {"$project": {"_id": 1}},
+                ],
                 "as": "emp",
             }
         },
         {"$unwind": "$emp"},
-        {"$match": {"emp.department": department}},
         {
             "$group": {
                 "_id": "$date",
