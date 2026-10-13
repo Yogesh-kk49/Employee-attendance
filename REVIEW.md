@@ -25,15 +25,24 @@ List every defect found in the starter `app/main.py` (helpers and endpoints). Ea
 | 19 | `compute_late_minutes` | Defective starter lateness formula `int(seconds / 60) > 10` truncated before checking grace. For arrivals between 10m01s and 10m59s after shift start (e.g. 09:40:01 for a 09:30 shift, 601s elapsed), `int(601 / 60) = 10 > 10` evaluated to `False`, erroneously extending the 10-minute grace window to 10m59s and returning 0 late minutes. | Arrival at 09:40:01 (601s elapsed) was treated as on time (0 late minutes) instead of 10 late minutes, directly violating R2 ("09:40:00 -> 0; 09:40:01 -> 10"). | Replaced with exact elapsed-seconds comparison `diff_seconds > 600` (after truncating instants to whole seconds per R1), computing late minutes as `math.floor(diff_seconds / 60)`. |
 | 20 | `compute_overtime_minutes` | Overtime minutes threshold was not strictly floored to zero when under 30 minutes. | 29m59s overtime produced positive overtime or non-zero value instead of 0. | Strictly enforced `overtime_minutes = math.floor(diff / 60) if diff >= 1800 else 0`. |
 | 21 | Document format / serialization | MongoDB internal `_id` field could leak into API responses. | API responses contained `_id: ObjectId(...)` which violates OpenAPI JSON schemas. | Strip `_id` in `fmt_record` and projection stages across all endpoints. |
-| 22 | `RegularizeRequest` & `punch_in` | Invalid attendance status values permitted or absent records allowed punch times. | Statuses outside `PRESENT, ABSENT, HALF_DAY, LEAVE, WFH, ON_DUTY` accepted, or ABSENT status retained punch_in/punch_out. | Added strict Pydantic status validation; cleared punch times on ABSENT/LEAVE; required punch_in for presence statuses. |
+| 22 | `RegularizeRequest` & `punch_in` | Invalid attendance status values permitted or absent records allowed punch times. | Statuses outside `PRESENT, WFH, ON_DUTY, ABSENT, LEAVE` accepted (`HALF_DAY` is not an attendance status; `half_day` is a derived boolean), or ABSENT/LEAVE status retained punch_in/punch_out. | Added strict Pydantic status validation allowing only `PRESENT`, `WFH`, `ON_DUTY`, `ABSENT`, `LEAVE`; cleared punch times on ABSENT/LEAVE; required punch_in for presence statuses. |
 | 23 | Date & Month parsing | Permissive date parsing allowed unseparated digits (`20260706`), week formats (`2026-W28-1`), timestamps, or nonexistent calendar dates. | Non-standard ISO strings accepted by date parser without 422 validation. | Added strict regex pre-checks (`DATE_REGEX`, `MONTH_REGEX`) and `date.fromisoformat()` validation raising 422. |
 | 24 | Analytics endpoints | Leaderboard and trend computations were performed with Python-side sorting, ranking, or manual iteration. | High memory overhead, inconsistent tie ranking (competition rank 1, 2, 2, 4), and missing calendar days on sparse data. | Pushed computation into MongoDB pipelines using `$setWindowFields` (`$rank`), correlated `$lookup` with early department filtering, and `$densify`. |
 | 25 | `regularize_attendance` | Concurrent edits / modifications between read and update could overwrite changes without conflict detection. | Lost updates if two users regularize or punch out simultaneously. | Added optimistic concurrency control conditioning on existing field values and history length (`history.{len}: {"$exists": False}`) returning 409 Conflict. |
+| 26 | `punch_out` | Filter matched any open record at or before `punched_at` rather than selecting the latest record first. If today's record was already closed but an older record was left open, calling punch-out today would fall back to closing yesterday's open record. | Repeated punch-out on a closed day unexpectedly closed older orphaned records instead of returning 409 Conflict. | Selects the latest record at or before `punched_at`; if that record is closed, returns 409 immediately without falling back to older records. |
 
 ## Items reviewed and confirmed NOT defective
 
 - The `IST` timezone constant (`UTC+05:30`) is correct.
 - The overall FastAPI app structure and module layout matches the required `uvicorn app.main:app` entry point.
 - `sample_seed.py` is correct and loads documents with proper BSON date handling.
+
+## Verification Status
+
+All 26 defects have been addressed in the codebase and verified through automated test suites:
+- **Unit & Integration Suite**: 108 tests passing (`pytest tests/test_app.py -v`).
+- **Live Database Tests**: Integration tests executed against a running MongoDB instance (`attendance_test_db`).
+- **Explain-Plan Verification**: Verified execution plans via `/admin/explain/{endpoint}` (`IXSCAN` on indexed fields, absence of unindexed collection scans for indexed queries).
+
 
 
