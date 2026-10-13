@@ -1,13 +1,11 @@
-# Architectural Decisions
+# DECISIONS.md
 
-### 1. Database Indexes & Initialization
-Startup creates required BSON indexes idempotently with bounded retries: unique `emp_code`, `joined_on`, and `(department, joined_on)` on `employees`; unique `(emp_code, date)`, `(date DESC, emp_code ASC)`, and `date ASC` on `attendance_logs`. These eliminate collection scans across analytics queries and listing endpoints.
+1. **Indexes.** `employees.emp_code` unique: race-safe employee creation. `employees (department, joined_on)` and `joined_on`: headcount (R9) for summary and trend. `attendance_logs (emp_code, date)` unique: one record per day, which makes punch-in race-safe, and it serves per-employee queries. `attendance_logs (date desc, emp_code asc)`: the `GET /attendance` sort and every date-range scan. Rejected: a separate `date`-only index, redundant with the compound one and extra write cost.
 
-### 2. Concurrency Control
-Race conditions on `POST /attendance/punch-in` are handled without application-level locks: MongoDB's unique `(emp_code, date)` compound index rejects duplicate insertions via `DuplicateKeyError`, returning HTTP 409. For `PATCH /attendance/{emp_code}/{date}`, optimistic locking uses atomic `find_one_and_update` matching pre-read field values (`punch_in`, `punch_out`, `status`) and array length `history.{len}: {"$exists": False}`, returning 409 on interleaved modifications.
+2. **Punch-in race.** Both requests validate, find the employee, and call `insert_one` with no existence check. The unique `(emp_code, date)` index lets exactly one insert commit; the other raises `DuplicateKeyError`, which I return as 409.
 
-### 3. Pure Aggregation Analytics
-All analytics operations execute inside MongoDB pipelines. The late leaderboard leverages `$setWindowFields` with `$rank` to calculate competition rankings (1, 2, 2, 4) in-engine. Department summary queries from `employees` with outer-joined correlated `$lookup` on `attendance_logs` to retain zero-log headcount. Department trend generates complete calendars using `$densify` and calculates 7-day moving averages via `$setWindowFields`.
+3. **Ties.** Ranking is done in the pipeline with `$setWindowFields`/`$rank`, then `rank <= limit` is applied. A tie at the cutoff returns every tied employee, so the response can have more than `limit` rows (ranks 1, 2, 2, 4).
 
-### 4. Scaling to 100× Data
-At 100× data volume, the daily correlated headcount `$lookup` in the trend pipeline should be replaced by a pre-aggregated milestone array or time-series collection to avoid repetitive employee scans.
+4. **Headcount.** The summary starts from `employees` (`joined_on <= month end`) and `$lookup`s logs with `preserveNullAndEmptyArrays`, so an employee with no logs still reaches the `$group`, where headcount counts distinct `emp_code`s.
+
+5. **100x data.** The trend pipeline joins every log to its employee, and looks up headcount once per day. I would store `department` on each log or keep daily roll-ups, and use keyset instead of skip pagination.
