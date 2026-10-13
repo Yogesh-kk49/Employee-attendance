@@ -6,7 +6,7 @@ FastAPI + MongoDB implementation of the HROne engineering assignment.
 
 ## Prerequisites
 
-- Python 3.10 or newer
+- Python 3.11 or newer
 - MongoDB 6.0 or newer (local, Docker, or Atlas free tier M0)
 
 ---
@@ -90,7 +90,7 @@ Readiness probe: http://localhost:8000/health
 | `GET` | `/analytics/departments/{department}/trend` | Daily attendance trend |
 | `GET` | `/admin/explain/{endpoint}` | MongoDB explain for an endpoint's query |
 
-Full contract: see `openapi.yaml`. Business rules R1–R10 are documented there.
+Business rules R1–R10 are documented in `DECISIONS.md`.
 
 ---
 
@@ -125,8 +125,6 @@ candidate_project/
 │   └── attendance_logs.json
 ├── tests/
 │   └── test_app.py      # Unit + integration tests
-├── openapi.yaml          # API contract (source of truth)
-├── DATA_MODEL.md         # MongoDB schema and sample documents
 ├── REVIEW.md             # Defects found in the starter code
 ├── DECISIONS.md          # Design rationale and trade-offs
 ├── README.md             # This file
@@ -143,4 +141,6 @@ candidate_project/
 - **Concurrency** for punch-in and employee creation is handled by MongoDB unique indexes, not application-level locks.
 - **Regularization** uses optimistic concurrency (history-length check) to prevent silent lost updates.
 - **Analytics** read stored derived values (`work_hours`, `late_minutes`, etc.) — they do not recompute from punch times.
-- **No `.env` file, no secrets, no Dockerfile** are included in the submission.
+- **Department trend** uses MongoDB `$densify` + `$setWindowFields` for gap-filling and moving averages inside the database.
+- **Explain endpoint** uses `db.command("explain", ..., verbosity="executionStats")` and mirrors the exact aggregation pipeline each endpoint runs.
+- **No `.env` file or secrets** are committed to the repository.
