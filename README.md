@@ -16,4 +16,4 @@ Real environment variables take priority over `.env`. Indexes are created at sta
 
 ## Notes
 - `REVIEW.md` lists the starter defects; `DECISIONS.md` explains the design choices.
-- Nothing is missing from the contract. The rules R1-R10 are in the assignment's `openapi.yaml`.
+- Core business rules (R1–R10: IST shift calculations, 10-minute lateness grace, 30-minute overtime threshold, half-up rounding, presence statuses, working days, and headcount) are fully implemented in `app/main.py`.
